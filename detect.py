@@ -201,7 +201,13 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
             s += '%gx%g ' % img.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
-            annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            # Create black image and draw annotations on that
+            # Filtering the black with a luma key yields a transparent image
+            # with only annotations; this is useful for overlaying over a live
+            # video
+            imdumb = im0.copy()
+            imdumb.fill(0)
+            annotator = Annotator(imdumb, line_width=line_thickness, example=str(names))
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
