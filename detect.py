@@ -10,6 +10,8 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
+from os.path import isfile
 
 import cv2
 import numpy as np
@@ -29,6 +31,55 @@ from utils.general import apply_classifier, check_img_size, check_imshow, check_
     strip_optimizer, xyxy2xywh
 from utils.plots import Annotator, colors
 from utils.torch_utils import load_classifier, select_device, time_sync
+
+import psycopg2
+import psycopg2.extras
+import threading
+
+class BirdbarDataLog():
+    """
+    Class that represents birdbar postgres server. Provides somet methods for
+    posting bird detection data to it.
+    """
+    def __init__(self, host, dbname, table, user, pw, push_interval=10):
+        self.connection = None
+        self.host = host
+        self.dbname = dbname
+        self.table = table
+        self.user = user
+        self.pw = pw
+        self.push_interval = push_interval
+        self.detections = []
+        self.mutex = threading.Lock()
+
+    def connect(self):
+        print(f"Connecting to postgres db: {self.host}:{self.dbname}/{self.table} (u: {self.user} p: {self.pw}")
+        self.connection = psycopg2.connect(host=self.host, dbname=self.dbname, user=self.user, password=self.pw)
+
+    def _push_detections_and_reschedule(self):
+        self.mutex.acquire()
+        try:
+            print(f"Pushing {len(self.detections)} detections to Postgres")
+            with self.connection:
+                with self.connection.cursor() as cursor:
+                    psycopg2.extras.execute_batch(cursor, "INSERT INTO birds_detected (timestamp, bird_id, confidence, count) VALUES (%s, %s, %s, %s)", self.detections)
+        finally:
+            self.mutex.release()
+        self.start_push_timer()
+
+    def start_push_timer(self):
+        self.timer = threading.Timer(self.push_interval, self._push_detections_and_reschedule)
+        self.timer.start()
+
+    def stop_push_timer(self):
+        self.timer.cancel()
+
+    def add_detection(self, n, cls, confidence):
+        if not self.connection:
+            return
+        self.mutex.acquire()
+        self.detections.append((datetime.now(), cls, confidence, n))
+        self.mutex.release()
 
 
 @torch.no_grad()
@@ -57,7 +108,9 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
         hide_conf=False,  # hide confidences
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
+        database=None, # log detections in Postgres
         ):
+
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
     webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
@@ -127,6 +180,15 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
         bs = 1  # batch_size
     vid_path, vid_writer = [None] * bs, [None] * bs
+
+    # Connect to DB
+    if database:
+        host, dbname, table, user, pw = database.split(",")
+        birdbar_db = BirdbarDataLog(host, dbname, table, user, pw)
+        birdbar_db.connect()
+        birdbar_db.start_push_timer()
+    else:
+        birdbar_db = None
 
     # Run inference
     if pt and device.type != 'cpu':
@@ -208,6 +270,12 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
             imdumb = im0.copy()
             imdumb.fill(0)
             annotator = Annotator(imdumb, line_width=line_thickness, example=str(names))
+            detected_classes_names = []
+
+            if not isfile("last_seen.txt"):
+                with open("last_seen.txt", "w") as last_seen:
+                    last_seen.write("---")
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
@@ -216,9 +284,20 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                    detected_classes_names.append(names[int(c)])
+
+                # Write last seen results
+                with open("last_seen.txt", "w") as last_seen:
+                    last_seen.write(", ".join(detected_classes_names))
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    # Send last seen results to DB
+                    #...
+                    n = (det[:, -1] == cls).sum()  # detections per class
+
+                    birdbar_db.add_detection(int(n), int(cls), float(conf))
+
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -231,6 +310,7 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
                         annotator.box_label(xyxy, label, color=colors(c, True))
                         if save_crop:
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+
 
             # Print time (inference-only)
             print(f'{s}Done. ({t3 - t2:.3f}s)')
@@ -297,6 +377,7 @@ def parse_opt():
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--database', type=str)
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(FILE.stem, opt)
