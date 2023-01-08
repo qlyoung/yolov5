@@ -64,6 +64,7 @@ class BirdbarDataLog():
                 with self.connection.cursor() as cursor:
                     psycopg2.extras.execute_batch(cursor, "INSERT INTO birds_detected (timestamp, bird_id, confidence, count) VALUES (%s, %s, %s, %s)", self.detections)
         finally:
+            self.detections = []
             self.mutex.release()
         self.start_push_timer()
 
@@ -295,8 +296,8 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
                     # Send last seen results to DB
                     #...
                     n = (det[:, -1] == cls).sum()  # detections per class
-
-                    birdbar_db.add_detection(int(n), int(cls), float(conf))
+                    if birdbar_db:
+                        birdbar_db.add_detection(int(n), int(cls), float(conf))
 
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
